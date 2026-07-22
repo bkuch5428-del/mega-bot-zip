@@ -23,6 +23,13 @@ const http   = require('http');
 const crypto = require('crypto');
 require('dotenv').config();
 
+// ─── Active task registry & stop signals ─────────────────────────────────────
+// activeTasks  : userId → { megaUrl, chatId, type ('single'|'folder') }
+// stopSignals  : userId → 'pause' | 'cancel'
+// Both are in-memory. Stop/cancel persists via the session file on disk.
+const activeTasks = new Map();
+const stopSignals = new Map();
+
 // ─── Global crash guards ─────────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
     console.error(`[FATAL] uncaughtException at ${new Date().toISOString()}:`);
@@ -228,6 +235,23 @@ function clearSession(megaUrl) {
         const p = path.join(SESSION_DIR, `${sessionKey(megaUrl)}.json`);
         if (fs.existsSync(p)) fs.unlinkSync(p);
     } catch (err) { log('WARN', `Clear session: ${err.message}`); }
+}
+
+// Scan session directory for a paused session belonging to a specific user.
+function findPausedSession(userId) {
+    try {
+        if (!fs.existsSync(SESSION_DIR)) return null;
+        const files = fs.readdirSync(SESSION_DIR).filter(f => f.endsWith('.json'));
+        for (const f of files) {
+            try {
+                const data = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), 'utf8'));
+                if (String(data.userId) === String(userId) && data.status === 'paused') {
+                    return data;
+                }
+            } catch (_) {}
+        }
+    } catch (err) { log('WARN', `findPausedSession: ${err.message}`); }
+    return null;
 }
 
 // ─── MEGA: load a single file or folder node (metadata only) ─────────────────
@@ -494,10 +518,17 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
             url:        megaUrl,
             folderName,
             chatId,
+            userId,
             totalFiles,
             totalSize,
             completed:  [],   // array of successfully uploaded file names
+            status:     'active',
         };
+        saveSession(megaUrl, session);
+    } else {
+        // Resuming: mark active and ensure userId is recorded.
+        session.status = 'active';
+        session.userId = userId;
         saveSession(megaUrl, session);
     }
 
@@ -538,6 +569,59 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
 
     // ── 4. Process files one by one ───────────────────────────────────────────
     for (let i = 0; i < pendingFiles.length; i++) {
+
+        // ── Check stop/cancel signal before starting the next file ────────────
+        if (stopSignals.has(userId)) {
+            const signal = stopSignals.get(userId);
+            stopSignals.delete(userId);
+            const remaining = pendingFiles.length - i;
+
+            if (signal === 'cancel') {
+                clearSession(megaUrl);
+                cleanupFolder(tempDir);
+                await editProgress(
+                    `❌ *Download Cancelled*\n\n` +
+                    `📁 *Folder:* \`${folderName}\`\n` +
+                    `✅ Sent: ${sentCount}/${totalFiles}  ❌ Failed: ${failedCount}`
+                );
+                await safeReply(ctx,
+                    `🗑 *Download cancelled.* All temporary files have been deleted.`,
+                    { parse_mode: 'Markdown' }
+                );
+                log('INFO', `🗑 Folder cancelled by user. sent=${sentCount} remaining=${remaining}`);
+                return;
+            }
+
+            // signal === 'pause'
+            session.status = 'paused';
+            saveSession(megaUrl, session);
+            await editProgress(
+                `⏸ *Download Paused*\n\n` +
+                `📁 *Folder:* \`${folderName}\`\n` +
+                `✅ Sent: ${sentCount}/${totalFiles}  ❌ Failed: ${failedCount}`
+            );
+            await safeReply(ctx,
+                `⏸ *Download Paused Successfully*\n\n` +
+                `✅ Completed Files: ${sentCount}/${totalFiles}\n` +
+                `📋 Remaining Files: ${remaining}\n\n` +
+                `Progress has been saved\\.`,
+                {
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '▶ Resume', callback_data: `resume:${userId}` }],
+                            [
+                                { text: '❌ Cancel', callback_data: `cancel:${userId}` },
+                                { text: '🏠 Main Menu', callback_data: `main_menu:${userId}` },
+                            ],
+                        ],
+                    },
+                }
+            );
+            log('INFO', `⏸ Folder paused by user. sent=${sentCount} remaining=${remaining}`);
+            return;
+        }
+
         const fileNode   = pendingFiles[i];
         const globalIdx  = sentCount + failedCount + i + 1; // position in the full list
         const tempPath   = path.join(tempDir, fileNode.name.replace(/[/\\]/g, '_'));
@@ -645,12 +729,24 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
 
 // ─── Core handler ─────────────────────────────────────────────────────────────
 async function processMegaLink(ctx, megaLink) {
-    const userId   = ctx.from ? ctx.from.id : ctx.chat.id;
+    const userId   = String(ctx.from ? ctx.from.id : ctx.chat.id);
     const chatId   = ctx.chat.id;
     const chatType = ctx.chat.type;
 
+    // Prevent starting a second task while one is already running.
+    if (activeTasks.has(userId)) {
+        await safeReply(ctx,
+            `⚠️ *You already have an active download\\.*\n\nUse /stop to pause it first\\.`,
+            { parse_mode: 'MarkdownV2' }
+        );
+        return;
+    }
+
     log('INFO', `📩 Processing | chat=${chatId} (${chatType}) user=${userId}`);
     log('INFO', `🔗 URL: ${megaLink}`);
+
+    // Register task (type updated to 'folder' inside processFolderStreaming).
+    activeTasks.set(userId, { megaUrl: megaLink, chatId, type: 'single' });
 
     let statusMsg = null;
 
@@ -677,6 +773,7 @@ async function processMegaLink(ctx, megaLink) {
 
         if (item.directory) {
             // ── FOLDER: stream one file at a time ─────────────────────────────
+            activeTasks.set(userId, { megaUrl: megaLink, chatId, type: 'folder' });
             await processFolderStreaming(ctx, item, megaLink, statusMsg);
             statusMsg = null; // processFolderStreaming owns and deletes it
 
@@ -700,6 +797,9 @@ async function processMegaLink(ctx, megaLink) {
         } else {
             await safeReply(ctx, msg);
         }
+    } finally {
+        activeTasks.delete(userId);
+        stopSignals.delete(userId);
     }
 }
 
@@ -717,6 +817,10 @@ bot.start((ctx) => {
         `• Folder files sent one by one – no disk overload\n` +
         `• Auto-resumes if interrupted\n` +
         `• Shows download and upload progress separately\n\n` +
+        `*Commands:*\n` +
+        `• /stop – Pause the current folder download\n` +
+        `• /resume – Continue a paused download\n` +
+        `• /cancel – Cancel and delete all temp files\n\n` +
         `*Supported Formats:*\n` +
         `• \`https://mega.nz/file/ID#KEY\`\n` +
         `• \`https://mega.nz/folder/ID#KEY\`\n\n` +
@@ -755,6 +859,185 @@ bot.help((ctx) => {
             { parse_mode: 'Markdown' }
         ).catch(err => log('WARN', `help reply: ${err.message}`));
     }
+});
+
+// ─── /stop ────────────────────────────────────────────────────────────────────
+bot.command('stop', async (ctx) => {
+    const userId = String(ctx.from ? ctx.from.id : ctx.chat.id);
+
+    if (!activeTasks.has(userId)) {
+        await safeReply(ctx, '❌ No active download found\\. Start one by sending a MEGA link\\.', { parse_mode: 'MarkdownV2' });
+        return;
+    }
+
+    const task = activeTasks.get(userId);
+    if (task.type === 'single') {
+        await safeReply(ctx,
+            '⚠️ *A single\\-file download is running\\.* It will complete shortly and cannot be paused\\.',
+            { parse_mode: 'MarkdownV2' }
+        );
+        return;
+    }
+
+    // Signal the folder loop to pause after the current file finishes.
+    stopSignals.set(userId, 'pause');
+    await safeReply(ctx,
+        '⏸ *Stopping…*\n\nThe current file will finish uploading first, then the download will pause\\.',
+        { parse_mode: 'MarkdownV2' }
+    );
+    log('INFO', `⏸ /stop requested by user ${userId}`);
+});
+
+// ─── /resume ──────────────────────────────────────────────────────────────────
+bot.command('resume', async (ctx) => {
+    const userId = String(ctx.from ? ctx.from.id : ctx.chat.id);
+
+    if (activeTasks.has(userId)) {
+        await safeReply(ctx, '⚠️ A download is already in progress\\.', { parse_mode: 'MarkdownV2' });
+        return;
+    }
+
+    const session = findPausedSession(userId);
+    if (!session) {
+        await safeReply(ctx, '❌ No paused download found\\.', { parse_mode: 'MarkdownV2' });
+        return;
+    }
+
+    const done      = session.completed ? session.completed.length : 0;
+    const total     = session.totalFiles || '?';
+    const remaining = (typeof total === 'number') ? total - done : '?';
+
+    await safeReply(ctx,
+        `▶️ *Resuming download…*\n\n` +
+        `📁 *Folder:* \`${session.folderName}\`\n` +
+        `✅ *Already done:* ${done}/${total}\n` +
+        `📋 *Remaining:* ${remaining}`,
+        { parse_mode: 'Markdown' }
+    );
+
+    log('INFO', `▶️ /resume requested by user ${userId} – folder "${session.folderName}"`);
+
+    // Re-dispatch through the normal pipeline; session state is already on disk.
+    await processMegaLink(ctx, session.url);
+});
+
+// ─── /cancel ──────────────────────────────────────────────────────────────────
+bot.command('cancel', async (ctx) => {
+    const userId = String(ctx.from ? ctx.from.id : ctx.chat.id);
+
+    const hasActive = activeTasks.has(userId);
+    const session   = !hasActive ? findPausedSession(userId) : null;
+
+    if (!hasActive && !session) {
+        await safeReply(ctx, '❌ Nothing to cancel\\.', { parse_mode: 'MarkdownV2' });
+        return;
+    }
+
+    if (hasActive) {
+        // Signal the running loop to cancel after the current file.
+        stopSignals.set(userId, 'cancel');
+        await safeReply(ctx,
+            '🗑 *Cancelling…*\n\nThe current file will finish, then all temp files will be deleted\\.',
+            { parse_mode: 'MarkdownV2' }
+        );
+        log('INFO', `🗑 /cancel requested (active) by user ${userId}`);
+    } else {
+        // Paused session – clean up immediately.
+        clearSession(session.url);
+        const tempDir = path.join(os.tmpdir(), 'mega-bot', userId);
+        cleanupFolder(tempDir);
+        await safeReply(ctx,
+            `🗑 *Download cancelled\\.*\n\n📁 *Folder:* \`${session.folderName}\`\n\nAll temporary files have been deleted\\.`,
+            { parse_mode: 'MarkdownV2' }
+        );
+        log('INFO', `🗑 /cancel requested (paused) by user ${userId} – folder "${session.folderName}"`);
+    }
+});
+
+// ─── Inline button callbacks ───────────────────────────────────────────────────
+// Buttons are sent with the pause message: resume:<userId>, cancel:<userId>, main_menu:<userId>
+
+bot.action(/^resume:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const targetUserId = ctx.match[1];
+    const callerId     = String(ctx.from ? ctx.from.id : ctx.chat.id);
+
+    if (callerId !== targetUserId) {
+        await ctx.answerCbQuery('⛔ Only the person who started this download can resume it.').catch(() => {});
+        return;
+    }
+
+    if (activeTasks.has(callerId)) {
+        await ctx.answerCbQuery('A download is already running.').catch(() => {});
+        return;
+    }
+
+    const session = findPausedSession(callerId);
+    if (!session) {
+        try { await ctx.editMessageText('❌ No paused download found.'); } catch (_) {}
+        return;
+    }
+
+    try {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    } catch (_) {}
+
+    log('INFO', `▶️ Resume button pressed by user ${callerId}`);
+    await processMegaLink(ctx, session.url);
+});
+
+bot.action(/^cancel:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const targetUserId = ctx.match[1];
+    const callerId     = String(ctx.from ? ctx.from.id : ctx.chat.id);
+
+    if (callerId !== targetUserId) {
+        await ctx.answerCbQuery('⛔ Only the person who started this download can cancel it.').catch(() => {});
+        return;
+    }
+
+    const hasActive = activeTasks.has(callerId);
+    const session   = !hasActive ? findPausedSession(callerId) : null;
+
+    if (!hasActive && !session) {
+        try { await ctx.editMessageText('❌ Nothing to cancel.'); } catch (_) {}
+        return;
+    }
+
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (_) {}
+
+    if (hasActive) {
+        stopSignals.set(callerId, 'cancel');
+        try { await ctx.editMessageText('🗑 Cancelling… The current file will finish, then temp files will be deleted.'); } catch (_) {}
+        log('INFO', `🗑 Cancel button pressed (active) by user ${callerId}`);
+    } else {
+        clearSession(session.url);
+        const tempDir = path.join(os.tmpdir(), 'mega-bot', callerId);
+        cleanupFolder(tempDir);
+        try {
+            await ctx.editMessageText(
+                `🗑 Download cancelled.\n\n📁 Folder: ${session.folderName}\n\nAll temporary files have been deleted.`
+            );
+        } catch (_) {}
+        log('INFO', `🗑 Cancel button pressed (paused) by user ${callerId}`);
+    }
+});
+
+bot.action(/^main_menu:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (_) {}
+    ctx.reply(
+        `🤖 *MEGA Downloader Bot*\n\n` +
+        `Send me any MEGA link to download it!\n\n` +
+        `*Commands:*\n` +
+        `• /stop – Pause the current folder download\n` +
+        `• /resume – Continue a paused download\n` +
+        `• /cancel – Cancel and delete all temp files\n\n` +
+        `*Supported formats:*\n` +
+        `• \`https://mega.nz/file/ID#KEY\`\n` +
+        `• \`https://mega.nz/folder/ID#KEY\``,
+        { parse_mode: 'Markdown' }
+    ).catch(() => {});
 });
 
 bot.on('message', async (ctx) => {
