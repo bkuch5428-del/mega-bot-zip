@@ -1,69 +1,60 @@
 /**
  * MEGA Downloader Telegram Bot
  * Production-ready build for Render Free Web Service
+ *
+ * Folder strategy: stream one file at a time.
+ *   1. Load folder file list (metadata only – no download)
+ *   2. For each file: download → upload → delete temp → next
+ *   At most ONE file lives on disk at any moment.
+ *   Session state is persisted so a restart resumes from the last
+ *   successfully uploaded file.
  */
 
 'use strict';
 
-const { Telegraf } = require('telegraf');
+const { Telegraf }      = require('telegraf');
 const { TelegramClient } = require('telegram');
 const { StringSession } = require('telegram/sessions');
-const mega = require('megajs');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const http = require('http');
+const mega   = require('megajs');
+const fs     = require('fs');
+const path   = require('path');
+const os     = require('os');
+const http   = require('http');
+const crypto = require('crypto');
 require('dotenv').config();
 
-// ─── Global crash guards ────────────────────────────────────────────────────
-// These MUST come first so no throw can escape the process.
-
+// ─── Global crash guards ─────────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
     console.error(`[FATAL] uncaughtException at ${new Date().toISOString()}:`);
     console.error(err.stack || err);
-    // Do NOT exit – keep the bot running.
 });
-
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
     console.error(`[FATAL] unhandledRejection at ${new Date().toISOString()}:`);
-    console.error('Promise:', promise);
-    console.error('Reason:', reason instanceof Error ? reason.stack : reason);
-    // Do NOT exit – keep the bot running.
+    console.error(reason instanceof Error ? reason.stack : reason);
 });
 
-// ─── Render health-check HTTP server ────────────────────────────────────────
-// Render Free Web Service requires a port to be open or it will kill the dyno.
+// ─── Render health-check HTTP server ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const healthServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
 });
-healthServer.listen(PORT, () => {
-    log('INFO', `Health-check server listening on port ${PORT}`);
-});
-healthServer.on('error', (err) => {
-    log('WARN', `Health server error: ${err.message}`);
-});
+healthServer.listen(PORT, () => log('INFO', `Health-check server on port ${PORT}`));
+healthServer.on('error', (err) => log('WARN', `Health server error: ${err.message}`));
 
-// ─── Logging ────────────────────────────────────────────────────────────────
-
+// ─── Logger ───────────────────────────────────────────────────────────────────
 function log(level, message, extra) {
-    const ts = new Date().toISOString();
-    const line = `[${ts}] [${level}] ${message}`;
-    if (level === 'ERROR') {
-        console.error(line, extra !== undefined ? extra : '');
-    } else {
-        console.log(line, extra !== undefined ? extra : '');
-    }
+    const line = `[${new Date().toISOString()}] [${level}] ${message}`;
+    if (level === 'ERROR') console.error(line, extra !== undefined ? extra : '');
+    else                   console.log (line, extra !== undefined ? extra : '');
 }
 
-// ─── Telegram client setup ───────────────────────────────────────────────────
-
+// ─── Telegram client setup ────────────────────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const apiId = Number(process.env.API_ID);
+const apiId   = Number(process.env.API_ID);
 const apiHash = process.env.API_HASH;
-const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
+const client  = new TelegramClient(new StringSession(''), apiId, apiHash, {
     connectionRetries: 5,
 });
 
@@ -79,660 +70,690 @@ async function startMtproto() {
 
 let botUsername = '';
 
-// ─── Telegram API helpers ────────────────────────────────────────────────────
-
-/**
- * Returns true for errors that mean "this message can't be edited any more"
- * and should be silently swallowed.
- */
+// ─── Telegram API helpers ─────────────────────────────────────────────────────
 function isIgnorableEditError(err) {
-    const msg = err && (err.message || '');
+    const m = (err && err.message) || '';
     return (
-        msg.includes('message to edit not found') ||
-        msg.includes('message is not modified') ||
-        msg.includes('MESSAGE_ID_INVALID') ||
-        msg.includes('Bad Request: message to edit not found') ||
-        msg.includes('Bad Request: message is not modified')
+        m.includes('message to edit not found') ||
+        m.includes('message is not modified')   ||
+        m.includes('MESSAGE_ID_INVALID')
     );
 }
 
-/**
- * Safely edit a Telegram message.
- * - Swallows "not found" / "not modified" errors silently.
- * - Retries once after waiting if Telegram returns 429 Too Many Requests.
- * - Falls back to plain text if Markdown parse fails.
- */
 async function safeEditMessage(telegram, chatId, messageId, text, parseMode = 'Markdown') {
     if (!messageId) return;
-
-    const attemptEdit = async (pm) => {
+    const attempt = async (pm) => {
         try {
-            await telegram.editMessageText(chatId, messageId, null, text, pm ? { parse_mode: pm } : {});
+            await telegram.editMessageText(
+                chatId, messageId, null, text,
+                pm ? { parse_mode: pm } : {}
+            );
         } catch (err) {
-            if (isIgnorableEditError(err)) return; // silent
-
+            if (isIgnorableEditError(err)) return;
             const retryAfter = err.parameters && err.parameters.retry_after;
-            if (retryAfter || (err.message && err.message.includes('429'))) {
+            if (retryAfter || (err.message || '').includes('429')) {
                 const wait = ((retryAfter || 5) + 1) * 1000;
-                log('WARN', `429 Too Many Requests – waiting ${wait}ms before retry`);
+                log('WARN', `429 – waiting ${wait}ms`);
                 await sleep(wait);
                 try {
-                    await telegram.editMessageText(chatId, messageId, null, text, pm ? { parse_mode: pm } : {});
-                } catch (retryErr) {
-                    if (!isIgnorableEditError(retryErr)) {
-                        log('WARN', `Edit retry failed: ${retryErr.message}`);
-                    }
-                }
+                    await telegram.editMessageText(
+                        chatId, messageId, null, text,
+                        pm ? { parse_mode: pm } : {}
+                    );
+                } catch (e2) { if (!isIgnorableEditError(e2)) log('WARN', `Edit retry: ${e2.message}`); }
                 return;
             }
-
-            if (pm && (err.message || '').includes('parse')) {
-                // Markdown parse error – fall back to plain text
-                await attemptEdit(null);
-                return;
-            }
-
+            if (pm && (err.message || '').includes('parse')) { await attempt(null); return; }
             log('WARN', `Cannot edit message: ${err.message}`);
         }
     };
-
-    await attemptEdit(parseMode);
+    await attempt(parseMode);
 }
 
-/**
- * Safely delete a Telegram message, ignoring all errors.
- */
 async function safeDeleteMessage(telegram, chatId, messageId) {
     if (!messageId) return;
-    try {
-        await telegram.deleteMessage(chatId, messageId);
-    } catch (err) {
-        log('WARN', `Cannot delete message ${messageId}: ${err.message}`);
-    }
+    try { await telegram.deleteMessage(chatId, messageId); }
+    catch (err) { log('WARN', `Cannot delete msg ${messageId}: ${err.message}`); }
 }
 
-/**
- * Safely send a reply, falling back to plain text on Markdown errors.
- */
 async function safeReply(ctx, text, extra = {}) {
-    try {
-        return await ctx.reply(text, { parse_mode: 'Markdown', ...extra });
-    } catch (err) {
+    try { return await ctx.reply(text, { parse_mode: 'Markdown', ...extra }); }
+    catch (err) {
         if ((err.message || '').includes('parse')) {
-            try {
-                return await ctx.reply(text.replace(/[*_`[\]()~>#+=|{}.!\\]/g, ''), extra);
-            } catch (e2) {
-                log('ERROR', `Cannot send reply: ${e2.message}`);
-            }
+            try { return await ctx.reply(text.replace(/[*_`[\]()~>#+=|{}.!\\]/g, ''), extra); }
+            catch (e2) { log('ERROR', `Cannot reply: ${e2.message}`); }
         } else {
-            log('ERROR', `Cannot send reply: ${err.message}`);
+            log('ERROR', `Cannot reply: ${err.message}`);
         }
         return null;
     }
 }
 
-// ─── Utilities ───────────────────────────────────────────────────────────────
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
+// ─── Utilities ────────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const k = 1024, sizes = ['Bytes', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
-function isVideoFile(filename) {
-    const exts = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg', '.3gp', '.ogv'];
-    return exts.includes(path.extname(filename).toLowerCase());
-}
-
-function isImageFile(filename) {
-    const exts = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.svg', '.ico'];
-    return exts.includes(path.extname(filename).toLowerCase());
-}
-
-function isAudioFile(filename) {
-    const exts = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.wma', '.opus'];
-    return exts.includes(path.extname(filename).toLowerCase());
-}
+function isVideoFile(f) { return ['.mp4','.avi','.mov','.mkv','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ogv'].includes(path.extname(f).toLowerCase()); }
+function isImageFile(f) { return ['.jpg','.jpeg','.png','.gif','.bmp','.webp','.tiff','.svg','.ico'].includes(path.extname(f).toLowerCase()); }
+function isAudioFile(f) { return ['.mp3','.wav','.ogg','.flac','.m4a','.aac','.wma','.opus'].includes(path.extname(f).toLowerCase()); }
 
 function cleanMegaLink(link) {
     if (!link) return null;
-    let cleaned = link.trim().replace(/\s+/g, '').replace(/[<>]/g, '');
-    if (cleaned.includes('mega.nz')) {
-        if (!cleaned.startsWith('http')) cleaned = 'https://' + cleaned;
-        return cleaned;
-    }
-    return null;
+    let c = link.trim().replace(/\s+/g, '').replace(/[<>]/g, '');
+    if (!c.includes('mega.nz')) return null;
+    if (!c.startsWith('http')) c = 'https://' + c;
+    return c;
 }
 
 function cleanupFile(filePath) {
     try {
         if (filePath && fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
-            log('INFO', `🗑  Cleaned up file: ${path.basename(filePath)}`);
+            log('INFO', `🗑  Deleted: ${path.basename(filePath)}`);
         }
-    } catch (err) {
-        log('WARN', `Cleanup error (file): ${err.message}`);
-    }
+    } catch (err) { log('WARN', `Cleanup file: ${err.message}`); }
 }
 
 function cleanupFolder(folderPath) {
     try {
         if (folderPath && fs.existsSync(folderPath)) {
             fs.rmSync(folderPath, { recursive: true, force: true });
-            log('INFO', `🗑  Cleaned up folder: ${folderPath}`);
+            log('INFO', `🗑  Deleted folder: ${folderPath}`);
         }
-    } catch (err) {
-        log('WARN', `Cleanup error (folder): ${err.message}`);
-    }
+    } catch (err) { log('WARN', `Cleanup folder: ${err.message}`); }
 }
 
-// ─── File sending with retry ─────────────────────────────────────────────────
+// ─── Progress updater ─────────────────────────────────────────────────────────
+// Throttled to 7 s to stay well under Telegram rate limits.
+const PROGRESS_INTERVAL = 7000;
 
-const MAX_SEND_RETRIES = 3;
-const RETRY_BASE_DELAY = 3000; // ms
-
-async function sendTelegramFile(ctx, filePath, fileName, fileSize, progressCallback) {
-    const caption = `${fileName}\nSize: ${formatBytes(fileSize)}`;
-    const chatId = ctx.chat.id;
-    const forceDocument = !isVideoFile(fileName) && !isImageFile(fileName) && !isAudioFile(fileName);
-    let captionPrefix = '📄';
-    if (isVideoFile(fileName)) captionPrefix = '🎬';
-    else if (isImageFile(fileName)) captionPrefix = '🖼️';
-    else if (isAudioFile(fileName)) captionPrefix = '🎵';
-
-    log('INFO', `📤 Upload start: ${fileName} (${formatBytes(fileSize)})`);
-
-    for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
-        try {
-            await startMtproto();
-            const result = await client.sendFile(chatId, {
-                file: filePath,
-                caption: isVideoFile(fileName) ? '' : `${captionPrefix} ${caption}`,
-                forceDocument,
-                replyTo: ctx.message ? ctx.message.message_id : undefined,
-                progressCallback,
-            });
-            log('INFO', `✅ Upload complete: ${fileName}`);
-            return result;
-        } catch (err) {
-            const isNetwork = err.message && (
-                err.message.includes('ECONNRESET') ||
-                err.message.includes('ETIMEDOUT') ||
-                err.message.includes('ENOTFOUND') ||
-                err.message.includes('socket hang up') ||
-                err.message.includes('network') ||
-                err.message.includes('timeout')
-            );
-            const is429 = err.message && err.message.includes('429');
-
-            if (attempt < MAX_SEND_RETRIES && (isNetwork || is429)) {
-                const delay = is429
-                    ? ((err.parameters && err.parameters.retry_after || 10) + 1) * 1000
-                    : RETRY_BASE_DELAY * attempt;
-                log('WARN', `⚠️  Upload attempt ${attempt}/${MAX_SEND_RETRIES} failed for ${fileName}: ${err.message}. Retrying in ${delay}ms...`);
-                await sleep(delay);
-                continue;
-            }
-
-            log('ERROR', `❌ Upload failed for ${fileName} after ${attempt} attempt(s): ${err.message}`, err.stack);
-            throw err;
-        }
-    }
+function makeProgressBar(progress) {
+    const filled = Math.round(10 * progress);
+    return '▓'.repeat(filled) + '░'.repeat(10 - filled);
 }
 
-// ─── Progress updater ────────────────────────────────────────────────────────
-// Throttled to at most once every PROGRESS_INTERVAL ms to avoid 429 errors.
-
-const PROGRESS_INTERVAL = 7000; // 7 seconds
-
-function createProgressUpdater(editStatusFunc, actionPrefix, totalFiles = 1) {
+function createProgressUpdater(editFn) {
     let lastUpdate = 0;
-    let lastProgressText = '';
-    let pendingUpdate = null;
+    let lastText   = '';
+    let pending    = null;
 
-    return async (progress, fileName, fileSize, fileIndex = 1) => {
+    return (text) => {
         const now = Date.now();
-        // Always send the final 100 % update; otherwise throttle.
-        if (progress < 1 && now - lastUpdate < PROGRESS_INTERVAL) return;
-
-        const filledLength = Math.round(10 * progress);
-        const bar = '▓'.repeat(filledLength) + '░'.repeat(10 - filledLength);
-        const percentage = (progress * 100).toFixed(1);
-        const currentBytes = progress * fileSize;
-
-        const fileStatus = totalFiles > 1
-            ? `\n*File:* \`${fileName}\` [${fileIndex}/${totalFiles}]`
-            : `\n*Name:* \`${fileName}\``;
-
-        const prefix = typeof actionPrefix === 'function' ? actionPrefix() : actionPrefix;
-        const progressText = `${prefix}${fileStatus}\n*Progress:* ${percentage}%\n*Size:* ${formatBytes(currentBytes)} / ${formatBytes(fileSize)}\n[${bar}]`;
-
-        if (lastProgressText === progressText) return;
-
+        if (text === lastText) return;
+        if (now - lastUpdate < PROGRESS_INTERVAL) return;
         lastUpdate = now;
-        lastProgressText = progressText;
-
-        // Fire-and-forget – errors are handled inside safeEditMessage.
-        if (pendingUpdate) return; // don't stack calls
-        pendingUpdate = editStatusFunc(progressText).finally(() => { pendingUpdate = null; });
+        lastText   = text;
+        if (pending) return;
+        pending = editFn(text).finally(() => { pending = null; });
     };
 }
 
-// ─── MEGA download ───────────────────────────────────────────────────────────
+// ─── Session state (resume on restart) ───────────────────────────────────────
+// Stored in /tmp/mega-bot/sessions/<urlhash>.json
+// Tracks which file names have been successfully uploaded so a restarted bot
+// can skip them and continue from where it left off.
 
-async function getAllFilesFromFolder(folder) {
-    const files = [];
+const SESSION_DIR = path.join(os.tmpdir(), 'mega-bot', 'sessions');
+
+function sessionKey(megaUrl) {
+    return crypto.createHash('md5').update(megaUrl).digest('hex').slice(0, 16);
+}
+
+function loadSession(megaUrl) {
     try {
-        if (folder.children && Array.isArray(folder.children)) {
-            for (const child of folder.children) {
-                if (child.directory) {
-                    files.push(...await getAllFilesFromFolder(child));
-                } else {
-                    files.push(child);
-                }
-            }
-        } else {
-            await new Promise((resolve, reject) => {
-                const load = folder.loadChildren || folder.getChildren;
-                if (typeof load === 'function') {
-                    load.call(folder, (err, children) => {
-                        if (err) reject(err);
-                        else { folder.children = children; resolve(); }
-                    });
-                } else {
-                    reject(new Error('Cannot load folder contents'));
-                }
-            });
-            for (const child of folder.children) {
-                if (child.directory) {
-                    files.push(...await getAllFilesFromFolder(child));
-                } else {
-                    files.push(child);
-                }
-            }
-        }
-    } catch (err) {
-        log('ERROR', `Error getting folder contents: ${err.message}`, err.stack);
-        throw err;
-    }
-    return files;
+        const p = path.join(SESSION_DIR, `${sessionKey(megaUrl)}.json`);
+        if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch (err) { log('WARN', `Load session: ${err.message}`); }
+    return null;
 }
 
-async function downloadMegaFolder(folder, tempDir, onProgress) {
-    log('INFO', `📁 Folder detected: ${folder.name}`);
-
-    const allFiles = await getAllFilesFromFolder(folder);
-    if (allFiles.length === 0) throw new Error('Folder is empty');
-
-    log('INFO', `📊 Found ${allFiles.length} files in folder`);
-
-    const folderDir = path.join(tempDir, folder.name);
-    if (!fs.existsSync(folderDir)) fs.mkdirSync(folderDir, { recursive: true });
-
-    const downloadedFiles = [];
-    const downloadErrors = [];
-
-    for (let i = 0; i < allFiles.length; i++) {
-        const file = allFiles[i];
-        const filePath = path.join(folderDir, file.name);
-        const fileDir = path.dirname(filePath);
-
-        try {
-            log('INFO', `⬇️  Downloading [${i + 1}/${allFiles.length}]: ${file.name}`);
-            if (!fs.existsSync(fileDir)) fs.mkdirSync(fileDir, { recursive: true });
-
-            await new Promise((resolve, reject) => {
-                const writeStream = fs.createWriteStream(filePath);
-                let downloadedBytes = 0;
-                let stream;
-
-                try {
-                    stream = file.download();
-                } catch (e) {
-                    return reject(e);
-                }
-
-                stream.on('data', chunk => {
-                    downloadedBytes += chunk.length;
-                    if (onProgress) {
-                        onProgress(downloadedBytes / (file.size || 1), file.name, file.size || 0, i + 1, allFiles.length);
-                    }
-                });
-
-                stream.on('error', (err) => {
-                    writeStream.destroy();
-                    cleanupFile(filePath);
-                    reject(err);
-                });
-
-                stream.pipe(writeStream);
-
-                writeStream.on('finish', () => {
-                    downloadedFiles.push({ path: filePath, name: file.name, size: file.size });
-                    log('INFO', `✅ Downloaded: ${file.name}`);
-                    resolve();
-                });
-
-                writeStream.on('error', (err) => {
-                    cleanupFile(filePath);
-                    reject(err);
-                });
-            });
-
-        } catch (err) {
-            log('ERROR', `❌ Failed to download ${file.name}: ${err.message}`);
-            downloadErrors.push(`${file.name}: ${err.message}`);
-            // Continue with next file – do NOT abort the whole folder.
-        }
-    }
-
-    if (downloadedFiles.length === 0) throw new Error('All downloads failed');
-
-    const totalSize = downloadedFiles.reduce((sum, f) => sum + f.size, 0);
-    return {
-        type: 'folder',
-        folderPath: folderDir,
-        files: downloadedFiles,
-        fileCount: downloadedFiles.length,
-        totalSize,
-        errors: downloadErrors,
-    };
+function saveSession(megaUrl, data) {
+    try {
+        if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
+        fs.writeFileSync(
+            path.join(SESSION_DIR, `${sessionKey(megaUrl)}.json`),
+            JSON.stringify(data, null, 2), 'utf8'
+        );
+    } catch (err) { log('WARN', `Save session: ${err.message}`); }
 }
 
-async function downloadMegaFile(megaUrl, userId, onProgress) {
-    log('INFO', `⬇️  Download start: ${megaUrl}`);
+function clearSession(megaUrl) {
+    try {
+        const p = path.join(SESSION_DIR, `${sessionKey(megaUrl)}.json`);
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+    } catch (err) { log('WARN', `Clear session: ${err.message}`); }
+}
 
-    const tempDir = path.join(os.tmpdir(), 'mega-bot', userId.toString());
-    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-
+// ─── MEGA: load a single file or folder node (metadata only) ─────────────────
+function loadMegaItem(megaUrl) {
     return new Promise((resolve, reject) => {
         let file;
-        try {
-            file = mega.File.fromURL(megaUrl);
-        } catch (err) {
-            return reject(new Error(`Invalid MEGA link: ${err.message}`));
-        }
+        try { file = mega.File.fromURL(megaUrl); }
+        catch (err) { return reject(new Error(`Invalid MEGA link: ${err.message}`)); }
 
         if (!file) return reject(new Error('Could not parse MEGA URL'));
 
         file.loadAttributes((err) => {
             if (err) {
-                log('ERROR', `❌ Error loading MEGA attributes: ${err.message}`);
-                let errorMsg = `Failed to load: ${err.message}`;
-                if (err.message.includes('ENOENT') || err.message.includes('not found')) {
-                    errorMsg = 'File/Folder not found. Link may be expired or invalid.';
-                } else if (err.message.includes('decryption')) {
-                    errorMsg = 'Decryption failed. Check if your link has the correct key.';
-                }
-                return reject(new Error(errorMsg));
+                let msg = `Failed to load MEGA item: ${err.message}`;
+                if (err.message.includes('ENOENT') || err.message.includes('not found'))
+                    msg = 'File/Folder not found. Link may be expired or invalid.';
+                else if (err.message.includes('decryption'))
+                    msg = 'Decryption failed. Check the #key in your link.';
+                return reject(new Error(msg));
             }
-
-            log('INFO', `✅ MEGA item loaded: ${file.name} (${formatBytes(file.size)})`);
-
-            if (file.directory) {
-                downloadMegaFolder(file, tempDir, onProgress).then(resolve).catch(reject);
-            } else {
-                const tempPath = path.join(tempDir, file.name);
-                log('INFO', `💾 Saving to: ${tempPath}`);
-
-                const writeStream = fs.createWriteStream(tempPath);
-                let downloadedBytes = 0;
-                let stream;
-
-                try {
-                    stream = file.download();
-                } catch (e) {
-                    return reject(new Error(`Download init failed: ${e.message}`));
-                }
-
-                stream.on('data', chunk => {
-                    downloadedBytes += chunk.length;
-                    if (onProgress) onProgress(downloadedBytes / (file.size || 1), file.name, file.size || 0, 1, 1);
-                });
-
-                stream.on('error', (err) => {
-                    log('ERROR', `❌ Download stream error: ${err.message}`);
-                    writeStream.destroy();
-                    cleanupFile(tempPath);
-                    reject(new Error(`Download failed: ${err.message}`));
-                });
-
-                stream.pipe(writeStream);
-
-                writeStream.on('finish', () => {
-                    log('INFO', `✅ Download complete: ${file.name}`);
-                    resolve({ type: 'file', path: tempPath, name: file.name, size: file.size });
-                });
-
-                writeStream.on('error', (err) => {
-                    log('ERROR', `❌ Write error: ${err.message}`);
-                    cleanupFile(tempPath);
-                    reject(new Error(`Failed to save file: ${err.message}`));
-                });
-            }
+            resolve(file);
         });
     });
 }
 
-// ─── Core handler ────────────────────────────────────────────────────────────
+// ─── MEGA: collect flat file list from a folder node (metadata only) ─────────
+// Returns an array of megajs File nodes. No data is downloaded here.
+async function collectFolderFiles(folder) {
+    const results = [];
 
+    async function walk(node) {
+        if (node.children && Array.isArray(node.children)) {
+            for (const child of node.children) {
+                if (child.directory) await walk(child);
+                else results.push(child);
+            }
+        } else {
+            // Children not yet loaded – load them now (metadata only).
+            await new Promise((resolve, reject) => {
+                const fn = node.loadChildren || node.getChildren;
+                if (typeof fn !== 'function')
+                    return reject(new Error('Cannot enumerate folder children'));
+                fn.call(node, (err, children) => {
+                    if (err) return reject(err);
+                    node.children = children;
+                    resolve();
+                });
+            });
+            for (const child of node.children) {
+                if (child.directory) await walk(child);
+                else results.push(child);
+            }
+        }
+    }
+
+    await walk(folder);
+    return results;
+}
+
+// ─── MEGA: download a single file node to disk (with retry) ──────────────────
+const MAX_DL_RETRIES = 3;
+const RETRY_BASE_MS  = 4000;
+
+async function downloadOneFile(fileNode, destPath, onProgress) {
+    for (let attempt = 1; attempt <= MAX_DL_RETRIES; attempt++) {
+        cleanupFile(destPath); // remove any partial file from a previous attempt
+
+        try {
+            log('INFO', `⬇️  DL attempt ${attempt}/${MAX_DL_RETRIES}: ${fileNode.name}`);
+            await new Promise((resolve, reject) => {
+                const ws = fs.createWriteStream(destPath);
+                let downloaded = 0;
+                let stream;
+                try { stream = fileNode.download(); }
+                catch (e) { ws.destroy(); return reject(e); }
+
+                stream.on('data', (chunk) => {
+                    downloaded += chunk.length;
+                    if (onProgress) onProgress(downloaded / (fileNode.size || 1));
+                });
+                stream.on('error', (e) => { ws.destroy(); reject(e); });
+                stream.pipe(ws);
+                ws.on('finish', resolve);
+                ws.on('error', reject);
+            });
+
+            log('INFO', `✅ DL complete: ${fileNode.name} (${formatBytes(fileNode.size)})`);
+            return; // success
+
+        } catch (err) {
+            cleanupFile(destPath);
+            if (attempt < MAX_DL_RETRIES) {
+                const delay = RETRY_BASE_MS * attempt;
+                log('WARN', `⚠️  DL attempt ${attempt} failed for "${fileNode.name}": ${err.message}. Retry in ${delay}ms`);
+                await sleep(delay);
+            } else {
+                throw new Error(`Download failed after ${MAX_DL_RETRIES} attempts: ${err.message}`);
+            }
+        }
+    }
+}
+
+// ─── Telegram: upload a local file (with retry) ───────────────────────────────
+const MAX_UL_RETRIES = 3;
+
+async function sendTelegramFile(ctx, filePath, fileName, fileSize, onProgress) {
+    const chatId       = ctx.chat.id;
+    const forceDoc     = !isVideoFile(fileName) && !isImageFile(fileName) && !isAudioFile(fileName);
+    let captionPrefix  = '📄';
+    if (isVideoFile(fileName))  captionPrefix = '🎬';
+    else if (isImageFile(fileName)) captionPrefix = '🖼️';
+    else if (isAudioFile(fileName)) captionPrefix = '🎵';
+    const caption = `${captionPrefix} ${fileName}\nSize: ${formatBytes(fileSize)}`;
+
+    log('INFO', `📤 UL start: ${fileName} (${formatBytes(fileSize)})`);
+
+    for (let attempt = 1; attempt <= MAX_UL_RETRIES; attempt++) {
+        try {
+            await startMtproto();
+            const result = await client.sendFile(chatId, {
+                file:             filePath,
+                caption:          isVideoFile(fileName) ? '' : caption,
+                forceDocument:    forceDoc,
+                replyTo:          ctx.message ? ctx.message.message_id : undefined,
+                progressCallback: onProgress,
+            });
+            log('INFO', `✅ UL complete: ${fileName}`);
+            return result;
+
+        } catch (err) {
+            const retryable =
+                err.message && (
+                    err.message.includes('ECONNRESET')    ||
+                    err.message.includes('ETIMEDOUT')     ||
+                    err.message.includes('ENOTFOUND')     ||
+                    err.message.includes('socket hang up')||
+                    err.message.includes('timeout')       ||
+                    err.message.includes('network')       ||
+                    err.message.includes('429')
+                );
+            if (attempt < MAX_UL_RETRIES && retryable) {
+                const retryAfter = err.parameters && err.parameters.retry_after;
+                const delay = retryAfter
+                    ? (retryAfter + 1) * 1000
+                    : RETRY_BASE_MS * attempt;
+                log('WARN', `⚠️  UL attempt ${attempt} failed for "${fileName}": ${err.message}. Retry in ${delay}ms`);
+                await sleep(delay);
+                continue;
+            }
+            log('ERROR', `❌ UL failed: ${fileName} – ${err.message}`, err.stack);
+            throw err;
+        }
+    }
+}
+
+// ─── Core: single MEGA file ───────────────────────────────────────────────────
+async function processSingleFile(ctx, fileNode, statusMsg) {
+    const chatId     = ctx.chat.id;
+    const chatType   = ctx.chat.type;
+    const userId     = ctx.from ? ctx.from.id : chatId;
+    const tempDir    = path.join(os.tmpdir(), 'mega-bot', userId.toString());
+    const tempPath   = path.join(tempDir, fileNode.name);
+    const MAX_TG_SIZE = 2000 * 1024 * 1024;
+
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+
+    const editStatus = (text) =>
+        safeEditMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id, text);
+
+    const updater = createProgressUpdater(editStatus);
+
+    if (fileNode.size > MAX_TG_SIZE) {
+        await editStatus(`❌ *File Too Large*\n\n*Name:* \`${fileNode.name}\`\n*Size:* ${formatBytes(fileNode.size)}\n\n⚠️ Telegram limit is 2 GB.`);
+        return;
+    }
+
+    // ── Download ──────────────────────────────────────────────────────────────
+    try {
+        await downloadOneFile(fileNode, tempPath, (p) => {
+            const pct  = (p * 100).toFixed(1);
+            const done = formatBytes(p * fileNode.size);
+            const tot  = formatBytes(fileNode.size);
+            updater(
+                `⬇️ *Downloading from MEGA*\n` +
+                `*Name:* \`${fileNode.name}\`\n` +
+                `*Progress:* ${pct}%  •  ${done} / ${tot}\n` +
+                `[${makeProgressBar(p)}]`
+            );
+        });
+    } catch (dlErr) {
+        await editStatus(`❌ *Download Failed*\n\n*File:* \`${fileNode.name}\`\n*Error:* ${dlErr.message}`);
+        cleanupFile(tempPath);
+        return;
+    }
+
+    await editStatus(
+        `✅ *Downloaded*\n\n*Name:* \`${fileNode.name}\`\n` +
+        `*Size:* ${formatBytes(fileNode.size)}\n\n📤 Uploading to Telegram…`
+    );
+
+    // ── Upload ────────────────────────────────────────────────────────────────
+    try {
+        await sendTelegramFile(ctx, tempPath, fileNode.name, fileNode.size, (p) => {
+            const pct  = (p * 100).toFixed(1);
+            const done = formatBytes(p * fileNode.size);
+            const tot  = formatBytes(fileNode.size);
+            updater(
+                `📤 *Uploading to Telegram*\n` +
+                `*Name:* \`${fileNode.name}\`\n` +
+                `*Progress:* ${pct}%  •  ${done} / ${tot}\n` +
+                `[${makeProgressBar(p)}]`
+            );
+        });
+
+        await safeDeleteMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id);
+        if (chatType !== 'private') await safeReply(ctx, '✅ *File sent successfully!*');
+
+    } catch (ulErr) {
+        await editStatus(`❌ *Upload Failed*\n\n*File:* \`${fileNode.name}\`\n*Error:* ${ulErr.message}`);
+    } finally {
+        cleanupFile(tempPath);
+    }
+}
+
+// ─── Core: MEGA folder – stream one file at a time ───────────────────────────
+async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
+    const chatId  = ctx.chat.id;
+    const userId  = ctx.from ? ctx.from.id : chatId;
+    const tempDir = path.join(os.tmpdir(), 'mega-bot', userId.toString());
+    const MAX_TG  = 2000 * 1024 * 1024;
+    const MAX_DISK_BYTES = 200 * 1024 * 1024; // 200 MB safety threshold for progress messages
+
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+
+    const editStatus = (text) =>
+        safeEditMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id, text);
+
+    // ── 1. Enumerate file list (metadata only – no download) ──────────────────
+    await editStatus('📂 *Loading folder contents…*\n\nReading file list from MEGA…');
+
+    let allFiles;
+    try {
+        allFiles = await collectFolderFiles(folderNode);
+    } catch (err) {
+        await editStatus(`❌ *Cannot Read Folder*\n\n*Error:* ${err.message}`);
+        return;
+    }
+
+    if (allFiles.length === 0) {
+        await editStatus('❌ *Folder is empty.*');
+        return;
+    }
+
+    const totalFiles = allFiles.length;
+    const totalSize  = allFiles.reduce((s, f) => s + (f.size || 0), 0);
+    const folderName = folderNode.name || 'folder';
+
+    log('INFO', `📁 Folder "${folderName}": ${totalFiles} files, ${formatBytes(totalSize)}`);
+
+    // ── 2. Load session (resume after restart) ────────────────────────────────
+    let session = loadSession(megaUrl);
+    if (!session) {
+        session = {
+            url:        megaUrl,
+            folderName,
+            chatId,
+            totalFiles,
+            totalSize,
+            completed:  [],   // array of successfully uploaded file names
+        };
+        saveSession(megaUrl, session);
+    }
+
+    const completedSet = new Set(session.completed);
+    const pendingFiles = allFiles.filter(f => !completedSet.has(f.name));
+    const alreadyDone  = totalFiles - pendingFiles.length;
+
+    if (alreadyDone > 0) {
+        log('INFO', `🔁 Resuming: ${alreadyDone} already done, ${pendingFiles.length} remaining`);
+    }
+
+    // ── 3. Announce start ─────────────────────────────────────────────────────
+    await safeDeleteMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id);
+    statusMsg = null;
+
+    await safeReply(ctx,
+        `📁 *Folder: ${folderName}*\n\n` +
+        `📊 *Total files:* ${totalFiles}\n` +
+        `💾 *Total size:* ${formatBytes(totalSize)}\n` +
+        (alreadyDone > 0
+            ? `🔁 *Resuming from file ${alreadyDone + 1}*\n\n`
+            : '\n') +
+        `📂 Processing files one by one…`
+    );
+
+    // Single persistent progress message updated throughout the whole folder.
+    let progressMsg = await safeReply(ctx,
+        `📤 *Folder Upload Starting…*\n\n` +
+        `✅ Sent: ${alreadyDone}/${totalFiles}\n❌ Failed: 0`
+    );
+
+    const editProgress = (text) =>
+        safeEditMessage(ctx.telegram, chatId, progressMsg && progressMsg.message_id, text);
+
+    let sentCount  = alreadyDone;
+    let failedCount = 0;
+    const progressUpdater = createProgressUpdater(editProgress);
+
+    // ── 4. Process files one by one ───────────────────────────────────────────
+    for (let i = 0; i < pendingFiles.length; i++) {
+        const fileNode   = pendingFiles[i];
+        const globalIdx  = sentCount + failedCount + i + 1; // position in the full list
+        const tempPath   = path.join(tempDir, fileNode.name.replace(/[/\\]/g, '_'));
+
+        log('INFO', `── File ${globalIdx}/${totalFiles}: ${fileNode.name} (${formatBytes(fileNode.size)})`);
+
+        // Skip files too large for Telegram
+        if (fileNode.size > MAX_TG) {
+            log('WARN', `⏭  Skip (>2 GB): ${fileNode.name}`);
+            failedCount++;
+            await editProgress(
+                `📁 *${folderName}*\n\n` +
+                `✅ Sent: ${sentCount}/${totalFiles}  ❌ Failed: ${failedCount}\n\n` +
+                `⏭ Skipped \\(>2 GB\\): \`${fileNode.name}\``
+            );
+            continue;
+        }
+
+        // ── 4a. Download this one file ────────────────────────────────────────
+        let dlOk = false;
+        try {
+            await downloadOneFile(fileNode, tempPath, (p) => {
+                const pct  = (p * 100).toFixed(1);
+                const done = formatBytes(p * (fileNode.size || 0));
+                const tot  = formatBytes(fileNode.size || 0);
+                progressUpdater(
+                    `📁 *${folderName}*\n` +
+                    `📊 File ${globalIdx}/${totalFiles}\n\n` +
+                    `⬇️ *Downloading:* \`${fileNode.name}\`\n` +
+                    `*Progress:* ${pct}%  •  ${done} / ${tot}\n` +
+                    `[${makeProgressBar(p)}]\n\n` +
+                    `✅ Sent: ${sentCount}  ❌ Failed: ${failedCount}`
+                );
+            });
+            dlOk = true;
+            log('INFO', `✅ Download OK: ${fileNode.name}`);
+        } catch (dlErr) {
+            log('ERROR', `❌ Download failed: ${fileNode.name} – ${dlErr.message}`, dlErr.stack);
+            failedCount++;
+            await editProgress(
+                `📁 *${folderName}*\n\n` +
+                `✅ Sent: ${sentCount}/${totalFiles}  ❌ Failed: ${failedCount}\n\n` +
+                `❌ DL error on \`${fileNode.name}\`:\n${dlErr.message}`
+            );
+            cleanupFile(tempPath);
+            continue; // move on – never abort the whole folder
+        }
+
+        // ── 4b. Upload immediately ────────────────────────────────────────────
+        try {
+            await sendTelegramFile(ctx, tempPath, fileNode.name, fileNode.size, (p) => {
+                const pct  = (p * 100).toFixed(1);
+                const done = formatBytes(p * (fileNode.size || 0));
+                const tot  = formatBytes(fileNode.size || 0);
+                progressUpdater(
+                    `📁 *${folderName}*\n` +
+                    `📊 File ${globalIdx}/${totalFiles}\n\n` +
+                    `📤 *Uploading:* \`${fileNode.name}\`\n` +
+                    `*Progress:* ${pct}%  •  ${done} / ${tot}\n` +
+                    `[${makeProgressBar(p)}]\n\n` +
+                    `✅ Sent: ${sentCount}  ❌ Failed: ${failedCount}`
+                );
+            });
+            sentCount++;
+            log('INFO', `✅ Upload OK [${sentCount}/${totalFiles}]: ${fileNode.name}`);
+
+            // Mark as completed in session – survive a restart.
+            session.completed.push(fileNode.name);
+            saveSession(megaUrl, session);
+
+            // Brief pause between files to ease Telegram rate limits.
+            await sleep(1500);
+
+        } catch (ulErr) {
+            log('ERROR', `❌ Upload failed: ${fileNode.name} – ${ulErr.message}`, ulErr.stack);
+            failedCount++;
+            await editProgress(
+                `📁 *${folderName}*\n\n` +
+                `✅ Sent: ${sentCount}/${totalFiles}  ❌ Failed: ${failedCount}\n\n` +
+                `❌ UL error on \`${fileNode.name}\`:\n${ulErr.message}`
+            );
+            // Continue – never abort the whole folder.
+
+        } finally {
+            // ── 4c. Delete the temp file immediately ──────────────────────────
+            cleanupFile(tempPath);
+        }
+    }
+
+    // ── 5. Final cleanup ──────────────────────────────────────────────────────
+    await safeDeleteMessage(ctx.telegram, chatId, progressMsg && progressMsg.message_id);
+    cleanupFolder(tempDir);
+    clearSession(megaUrl);
+
+    let summary = `✅ *Folder Transfer Complete!*\n\n`;
+    summary    += `📁 *Folder:* \`${folderName}\`\n`;
+    summary    += `📊 *Total files:* ${totalFiles}\n`;
+    summary    += `✅ *Sent:* ${sentCount}\n`;
+    if (failedCount > 0) summary += `❌ *Failed/Skipped:* ${failedCount}\n`;
+    summary    += `💾 *Total size:* ${formatBytes(totalSize)}`;
+
+    await safeReply(ctx, summary);
+    log('INFO', `📊 Folder done | sent=${sentCount} failed=${failedCount} total=${totalFiles}`);
+}
+
+// ─── Core handler ─────────────────────────────────────────────────────────────
 async function processMegaLink(ctx, megaLink) {
-    const userId = ctx.from ? ctx.from.id : ctx.chat.id;
-    const chatId = ctx.chat.id;
+    const userId   = ctx.from ? ctx.from.id : ctx.chat.id;
+    const chatId   = ctx.chat.id;
     const chatType = ctx.chat.type;
 
-    log('INFO', `📩 Processing MEGA link | chat ${chatId} (${chatType}) | user ${userId}`);
+    log('INFO', `📩 Processing | chat=${chatId} (${chatType}) user=${userId}`);
+    log('INFO', `🔗 URL: ${megaLink}`);
 
     let statusMsg = null;
-    const tempDir = path.join(os.tmpdir(), 'mega-bot', userId.toString());
 
     try {
-        // Send initial status message
-        statusMsg = await safeReply(ctx, '🔍 *Processing MEGA Link*\n\nChecking link...');
+        statusMsg = await safeReply(ctx, '🔍 *Processing MEGA Link*\n\nConnecting to MEGA…');
 
-        // Wrapper for editing the status message
-        const editStatus = (text) =>
-            safeEditMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id, text);
+        // ── Load MEGA metadata (no data transferred yet) ──────────────────────
+        let item;
+        try {
+            item = await loadMegaItem(megaLink);
+        } catch (err) {
+            const msg =
+                `❌ *Cannot Access Link*\n\n` +
+                `*Error:* ${err.message}\n\n` +
+                `*Please check:*\n` +
+                `1. Link is correct and not expired\n` +
+                `2. The #key is included at the end\n` +
+                `3. The file/folder is publicly shared`;
+            await safeEditMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id, msg);
+            return;
+        }
 
-        // ── Download ──────────────────────────────────────────────────────────
-        const downloadUpdater = createProgressUpdater(editStatus, '⬇️ *Downloading from MEGA*');
-        const result = await downloadMegaFile(megaLink, userId, downloadUpdater);
+        log('INFO', `✅ Loaded: "${item.name}" (${item.directory ? 'folder' : formatBytes(item.size)})`);
 
-        // ── Single file ───────────────────────────────────────────────────────
-        if (result.type === 'file') {
-            const maxFileSize = 2000 * 1024 * 1024;
+        if (item.directory) {
+            // ── FOLDER: stream one file at a time ─────────────────────────────
+            await processFolderStreaming(ctx, item, megaLink, statusMsg);
+            statusMsg = null; // processFolderStreaming owns and deletes it
 
-            if (result.size > maxFileSize) {
-                await editStatus(`❌ *File Too Large*\n\n*Name:* \`${result.name}\`\n*Size:* ${formatBytes(result.size)}\n\n⚠️ Telegram limit is 2 GB per file.`);
-                cleanupFile(result.path);
-                return;
-            }
-
-            await editStatus(`✅ *File Loaded*\n\n*Name:* \`${result.name}\`\n*Size:* ${formatBytes(result.size)}\n\n📤 Sending to Telegram...`);
-
-            try {
-                const uploadUpdater = createProgressUpdater(editStatus, '📤 *Uploading to Telegram*');
-                await sendTelegramFile(ctx, result.path, result.name, result.size, (progress) => {
-                    uploadUpdater(progress, result.name, result.size, 1, 1);
-                });
-
-                await safeDeleteMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id);
-
-                if (chatType !== 'private') {
-                    await safeReply(ctx, '✅ *File sent successfully!*');
-                }
-            } catch (sendErr) {
-                log('ERROR', `❌ Send failed for ${result.name}: ${sendErr.message}`, sendErr.stack);
-                await editStatus(`❌ *Failed to Send*\n\n*File:* \`${result.name}\`\n*Error:* ${sendErr.message}`);
-            } finally {
-                cleanupFile(result.path);
-            }
-
-        // ── Folder ────────────────────────────────────────────────────────────
-        } else if (result.type === 'folder') {
-            const folderName = path.basename(result.folderPath);
-
-            await editStatus(`📦 *Folder Ready*\n\n*Name:* \`${folderName}\`\n*Files:* ${result.fileCount}\n*Total Size:* ${formatBytes(result.totalSize)}\n\n📤 Starting to send files...`);
-            await safeDeleteMessage(ctx.telegram, chatId, statusMsg && statusMsg.message_id);
-            statusMsg = null;
-
-            await safeReply(ctx, `📁 *Folder Download Complete*\n\n*Name:* \`${folderName}\`\n*Files:* ${result.fileCount}\n*Total Size:* ${formatBytes(result.totalSize)}`);
-
-            let sentCount = 0;
-            let failedCount = 0;
-            const maxFileSize = 2000 * 1024 * 1024;
-
-            let progressMsg = await safeReply(ctx, `📤 *Sending Files*\n\n✅ Sent: 0/${result.fileCount}\n❌ Failed: 0`);
-
-            const folderUploadUpdater = createProgressUpdater(
-                (text) => safeEditMessage(ctx.telegram, chatId, progressMsg && progressMsg.message_id, text),
-                () => `📤 *Uploading Folder to Telegram*\n\n✅ Sent: ${sentCount}/${result.fileCount}\n❌ Failed: ${failedCount}`,
-                result.files.length
+        } else {
+            // ── SINGLE FILE ───────────────────────────────────────────────────
+            await safeEditMessage(
+                ctx.telegram, chatId, statusMsg && statusMsg.message_id,
+                `✅ *File Found*\n\n*Name:* \`${item.name}\`\n*Size:* ${formatBytes(item.size)}\n\n⬇️ Downloading…`
             );
-
-            for (let i = 0; i < result.files.length; i++) {
-                const file = result.files[i];
-                log('INFO', `📤 Queue [${i + 1}/${result.files.length}]: ${file.name}`);
-
-                try {
-                    if (file.size > maxFileSize) {
-                        log('WARN', `⏭  Skipping ${file.name} – exceeds 2 GB limit`);
-                        failedCount++;
-                        continue;
-                    }
-
-                    await sendTelegramFile(ctx, file.path, file.name, file.size, (progress) => {
-                        folderUploadUpdater(progress, file.name, file.size, i + 1);
-                    });
-
-                    sentCount++;
-                    log('INFO', `✅ Sent [${sentCount}/${result.fileCount}]: ${file.name}`);
-
-                    // Small pause between files to reduce rate-limit pressure.
-                    await sleep(1500);
-
-                } catch (fileErr) {
-                    log('ERROR', `❌ Failed to send ${file.name}: ${fileErr.message}`, fileErr.stack);
-                    failedCount++;
-                    // Continue to the next file – never abort the whole queue.
-                } finally {
-                    // Release the file buffer immediately after each upload.
-                    cleanupFile(file.path);
-                }
-            }
-
-            await safeDeleteMessage(ctx.telegram, chatId, progressMsg && progressMsg.message_id);
-            cleanupFolder(result.folderPath);
-
-            let summary = `✅ *Folder Transfer Complete!*\n\n`;
-            summary += `📁 *Folder:* \`${folderName}\`\n`;
-            summary += `📊 *Total Files:* ${result.fileCount}\n`;
-            summary += `✅ *Sent Successfully:* ${sentCount}\n`;
-            if (failedCount > 0) summary += `❌ *Failed/Skipped:* ${failedCount}\n`;
-            summary += `💾 *Total Size:* ${formatBytes(result.totalSize)}`;
-
-            await safeReply(ctx, summary);
-            log('INFO', `📊 Queue complete | sent=${sentCount} failed=${failedCount}`);
+            await processSingleFile(ctx, item, statusMsg);
+            statusMsg = null;
         }
 
     } catch (err) {
-        log('ERROR', `❌ processMegaLink error: ${err.message}`, err.stack);
-
-        const errorMessage =
-            `❌ *Download Failed*\n\n` +
-            `*Error:* ${err.message}\n\n` +
-            `*Please check:*\n` +
-            `1. Link is correct and not expired\n` +
-            `2. Includes #key at the end\n` +
-            `3. File/folder exists`;
-
+        log('ERROR', `❌ processMegaLink: ${err.message}`, err.stack);
+        const msg =
+            `❌ *Unexpected Error*\n\n*Error:* ${err.message}\n\n` +
+            `Please try again. If the problem persists, check the link.`;
         if (statusMsg) {
-            await safeEditMessage(ctx.telegram, chatId, statusMsg.message_id, errorMessage);
+            await safeEditMessage(ctx.telegram, chatId, statusMsg.message_id, msg);
         } else {
-            await safeReply(ctx, errorMessage);
+            await safeReply(ctx, msg);
         }
-
-    } finally {
-        // Always clean up the user's temp directory.
-        cleanupFolder(tempDir);
     }
 }
 
 // ─── Bot commands ─────────────────────────────────────────────────────────────
-
 bot.start((ctx) => {
     const chatType = ctx.chat.type;
     const chatName = chatType === 'private' ? 'here' : `in this ${chatType}`;
-
-    ctx.reply(`🤖 *MEGA Downloader Bot*
-
-*I can download MEGA files and folders ${chatName}!*
-
-Just send me any MEGA link and I'll download it.
-
-*Features:*
-• Works in private chats, groups, and channels
-• Downloads files and folders
-• Auto-detects file types
-• Shows progress
-• Automatic cleanup
-
-*Supported Formats:*
-• \`https://mega.nz/file/ID#KEY\`
-• \`https://mega.nz/folder/ID#KEY\`
-
-*For Groups/Channels:*
-1. Add me as admin
-2. Give me permission to read messages
-3. Send MEGA link in chat
-4. I'll download and send files directly
-
-Send me a MEGA link to get started!`, {
-        parse_mode: 'Markdown'
-    }).catch(err => log('WARN', `start reply error: ${err.message}`));
+    ctx.reply(
+        `🤖 *MEGA Downloader Bot*\n\n` +
+        `*I can download MEGA files and folders ${chatName}!*\n\n` +
+        `Just send me any MEGA link and I'll download it.\n\n` +
+        `*Features:*\n` +
+        `• Works in private chats, groups, and channels\n` +
+        `• Downloads files and entire folders\n` +
+        `• Folder files sent one by one – no disk overload\n` +
+        `• Auto-resumes if interrupted\n` +
+        `• Shows download and upload progress separately\n\n` +
+        `*Supported Formats:*\n` +
+        `• \`https://mega.nz/file/ID#KEY\`\n` +
+        `• \`https://mega.nz/folder/ID#KEY\`\n\n` +
+        `Send me a MEGA link to get started!`,
+        { parse_mode: 'Markdown' }
+    ).catch(err => log('WARN', `start reply: ${err.message}`));
 });
 
 bot.help((ctx) => {
     const chatType = ctx.chat.type;
-
     if (chatType === 'private') {
-        ctx.reply(`📖 *Help - Private Chat*
-
-Just send me any MEGA link and I'll download it for you!
-
-*Valid link formats:*
-✅ \`https://mega.nz/file/ABC123#XYZ456\`
-✅ \`https://mega.nz/folder/DEF789#UVW012\`
-
-*Requirements:*
-• Link must include #key at the end
-• File size must be under 2GB for Telegram`, {
-            parse_mode: 'Markdown'
-        }).catch(err => log('WARN', `help reply error: ${err.message}`));
+        ctx.reply(
+            `📖 *Help – Private Chat*\n\n` +
+            `Just send me any MEGA link and I'll handle it!\n\n` +
+            `*Valid link formats:*\n` +
+            `✅ \`https://mega.nz/file/ABC123#XYZ456\`\n` +
+            `✅ \`https://mega.nz/folder/DEF789#UVW012\`\n\n` +
+            `*Folder behaviour:*\n` +
+            `Files are sent one by one. I download a file, send it, delete it,\n` +
+            `then move to the next. Disk usage stays under 200 MB at all times.\n\n` +
+            `*Limits:*\n` +
+            `• Individual file must be under 2 GB (Telegram limit)\n` +
+            `• Link must include the #key`,
+            { parse_mode: 'Markdown' }
+        ).catch(err => log('WARN', `help reply: ${err.message}`));
     } else {
-        ctx.reply(`📖 *Help - ${chatType === 'group' ? 'Group' : 'Channel'}*
-
-I can download MEGA files here too!
-
-*IMPORTANT: For me to work in this ${chatType}:*
-1. I must be added as admin
-2. I need permission to read messages
-3. I need permission to send messages/media
-
-*How to use:*
-Just send any MEGA link in chat, I'll process it automatically.
-
-*Link formats:*
-• \`https://mega.nz/file/ID#KEY\`
-• \`https://mega.nz/folder/ID#KEY\``, {
-            parse_mode: 'Markdown'
-        }).catch(err => log('WARN', `help reply error: ${err.message}`));
+        ctx.reply(
+            `📖 *Help – ${chatType === 'group' ? 'Group' : 'Channel'}*\n\n` +
+            `I can download MEGA files here!\n\n` +
+            `*Requirements:*\n` +
+            `1. Add me as admin\n` +
+            `2. Enable read + send messages + send media\n\n` +
+            `*Link formats:*\n` +
+            `• \`https://mega.nz/file/ID#KEY\`\n` +
+            `• \`https://mega.nz/folder/ID#KEY\``,
+            { parse_mode: 'Markdown' }
+        ).catch(err => log('WARN', `help reply: ${err.message}`));
     }
 });
 
@@ -741,12 +762,14 @@ bot.on('message', async (ctx) => {
     if (!text) return;
 
     const megaLink = cleanMegaLink(text);
-
     if (!megaLink) {
         if (ctx.chat.type !== 'private') {
-            const username = ctx.botInfo && ctx.botInfo.username;
-            if (username && text.includes(`@${username}`)) {
-                await safeReply(ctx, `🤖 Hi! Send me a MEGA link to download files.\n\nExample: \`https://mega.nz/file/ABC123#XYZ456\``);
+            const uname = ctx.botInfo && ctx.botInfo.username;
+            if (uname && text.includes(`@${uname}`)) {
+                await safeReply(ctx,
+                    `🤖 Hi! Send me a MEGA link to download files.\n\n` +
+                    `Example: \`https://mega.nz/file/ABC123#XYZ456\``
+                );
             }
         }
         return;
@@ -754,41 +777,34 @@ bot.on('message', async (ctx) => {
 
     log('INFO', `🔍 MEGA link detected | ${ctx.chat.type} ${ctx.chat.id}`);
 
-    // Permission check for non-private chats
     if (ctx.chat.type !== 'private') {
         try {
-            const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
+            const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
 
             if (ctx.chat.type === 'channel') {
-                if (chatMember.status !== 'administrator') {
-                    log('WARN', `Bot is not admin in channel ${ctx.chat.id}`);
+                if (member.status !== 'administrator') {
+                    log('WARN', `Not admin in channel ${ctx.chat.id}`);
                     if (ctx.from) {
                         ctx.telegram.sendMessage(
                             ctx.from.id,
-                            `❌ I cannot process MEGA links in this channel because I'm not an admin.\n\nPlease make me an admin with permission to read and post messages.`
+                            `❌ I'm not an admin in that channel. Please make me admin with read/post permissions.`
                         ).catch(() => {});
                     }
                     return;
                 }
-                if (!chatMember.can_post_messages) {
-                    log('WARN', `Bot cannot post in channel ${ctx.chat.id}`);
-                    return;
-                }
+                if (!member.can_post_messages) { log('WARN', `Cannot post in channel ${ctx.chat.id}`); return; }
             }
 
             if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
-                if (chatMember.status === 'restricted' && !chatMember.can_send_messages) {
-                    log('WARN', `Bot cannot send messages in group ${ctx.chat.id}`);
-                    return;
+                if (member.status === 'restricted' && !member.can_send_messages) {
+                    log('WARN', `Restricted in group ${ctx.chat.id}`); return;
                 }
-                if (!['administrator', 'member', 'restricted'].includes(chatMember.status)) {
-                    log('WARN', `Bot has unexpected status in group ${ctx.chat.id}: ${chatMember.status}`);
-                    return;
+                if (!['administrator', 'member', 'restricted'].includes(member.status)) {
+                    log('WARN', `Bad status in group ${ctx.chat.id}: ${member.status}`); return;
                 }
             }
-
         } catch (err) {
-            log('ERROR', `Error checking permissions in ${ctx.chat.type} ${ctx.chat.id}: ${err.message}`);
+            log('ERROR', `Permission check failed in ${ctx.chat.type} ${ctx.chat.id}: ${err.message}`);
             return;
         }
     }
@@ -798,26 +814,23 @@ bot.on('message', async (ctx) => {
 
 bot.on('document', (ctx) => {
     if (ctx.chat.type === 'private') {
-        ctx.reply('📎 Send me a MEGA link to download files!\n\nExample:\n`https://mega.nz/file/ABC123#XYZ456`', {
-            parse_mode: 'Markdown'
-        }).catch(err => log('WARN', `document reply error: ${err.message}`));
+        ctx.reply(
+            '📎 Send me a MEGA link to download files!\n\nExample:\n`https://mega.nz/file/ABC123#XYZ456`',
+            { parse_mode: 'Markdown' }
+        ).catch(err => log('WARN', `document reply: ${err.message}`));
     }
 });
 
-// Global bot error handler – catches errors thrown by middleware/handlers.
 bot.catch((err, ctx) => {
     log('ERROR', `Bot middleware error: ${err.message}`, err.stack);
     try {
         if (ctx && ctx.chat && ctx.chat.type === 'private') {
             ctx.reply('❌ An internal error occurred. Please try again.').catch(() => {});
         }
-    } catch (e) {
-        log('ERROR', `Failed to send error reply: ${e.message}`);
-    }
+    } catch (e) { log('ERROR', `Failed to send error reply: ${e.message}`); }
 });
 
-// ─── Bot launch with retry ───────────────────────────────────────────────────
-
+// ─── Bot launch with auto-retry ───────────────────────────────────────────────
 const LAUNCH_RETRY_DELAY = 5000;
 
 async function launchWithRetry() {
@@ -825,20 +838,18 @@ async function launchWithRetry() {
     while (true) {
         attempt++;
         try {
-            log('INFO', `🚀 Launching bot (attempt ${attempt})...`);
-            const botInfo = await bot.telegram.getMe();
-            botUsername = botInfo.username;
-            log('INFO', `🤖 Bot username: @${botUsername}`);
-            log('INFO', `🔗 Bot invite link: https://t.me/${botUsername}`);
-
+            log('INFO', `🚀 Launching bot (attempt ${attempt})…`);
+            const info = await bot.telegram.getMe();
+            botUsername = info.username;
+            log('INFO', `🤖 @${botUsername} – https://t.me/${botUsername}`);
             await bot.launch();
-            log('INFO', '✅ Bot started successfully!');
-            log('INFO', '👥 Working in: Private chats, Groups, Channels');
-            log('INFO', `📁 Temp directory: ${os.tmpdir()}`);
-            break; // Success – exit the retry loop.
+            log('INFO', '✅ Bot running!');
+            log('INFO', `📁 Temp dir: ${os.tmpdir()}`);
+            log('INFO', `📂 Sessions: ${SESSION_DIR}`);
+            break;
         } catch (err) {
-            log('ERROR', `❌ Bot launch failed (attempt ${attempt}): ${err.message}`, err.stack);
-            log('INFO', `⏳ Retrying in ${LAUNCH_RETRY_DELAY / 1000}s...`);
+            log('ERROR', `❌ Launch failed (attempt ${attempt}): ${err.message}`, err.stack);
+            log('INFO', `⏳ Retrying in ${LAUNCH_RETRY_DELAY / 1000}s…`);
             await sleep(LAUNCH_RETRY_DELAY);
         }
     }
@@ -846,16 +857,6 @@ async function launchWithRetry() {
 
 launchWithRetry();
 
-// ─── Graceful shutdown ───────────────────────────────────────────────────────
-
-process.once('SIGINT', () => {
-    log('INFO', '🛑 SIGINT received – shutting down...');
-    bot.stop('SIGINT');
-    healthServer.close();
-});
-
-process.once('SIGTERM', () => {
-    log('INFO', '🛑 SIGTERM received – shutting down...');
-    bot.stop('SIGTERM');
-    healthServer.close();
-});
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+process.once('SIGINT',  () => { log('INFO', '🛑 SIGINT'); bot.stop('SIGINT');  healthServer.close(); });
+process.once('SIGTERM', () => { log('INFO', '🛑 SIGTERM'); bot.stop('SIGTERM'); healthServer.close(); });
