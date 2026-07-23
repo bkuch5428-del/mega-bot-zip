@@ -26,9 +26,3 @@ args = "node bot.js"
 localPort = 3000
 externalPort = 80
 
-[userenv]
-
-[userenv.shared]
-MEGA_EMAIL = "girirecap@gmail.com"
-BOT_TOKEN = "8825173245:AAGUeLjEHdI5wl-24DmEey4yX-9tWz877xo"
-
