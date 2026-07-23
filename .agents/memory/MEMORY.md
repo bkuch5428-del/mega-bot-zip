@@ -1,0 +1,1 @@
+- [MEGA folder selection](mega-folder-selection.md) — keep recursive folder scans metadata-only until the user explicitly starts an upload.

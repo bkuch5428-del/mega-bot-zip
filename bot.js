@@ -29,6 +29,8 @@ require('dotenv').config();
 // Both are in-memory. Stop/cancel persists via the session file on disk.
 const activeTasks = new Map();
 const stopSignals = new Map();
+// folderBrowsers : userId → metadata-only folder selection session
+const folderBrowsers = new Map();
 
 // ─── Global crash guards ─────────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
@@ -146,6 +148,10 @@ function formatBytes(bytes) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+const SUPPORTED_VIDEO_EXTENSIONS = new Set(['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v']);
+function isSupportedVideoFile(fileName) {
+    return SUPPORTED_VIDEO_EXTENSIONS.has(path.extname(fileName || '').toLowerCase());
+}
 function isVideoFile(f) { return ['.mp4','.avi','.mov','.mkv','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ogv'].includes(path.extname(f).toLowerCase()); }
 function isImageFile(f) { return ['.jpg','.jpeg','.png','.gif','.bmp','.webp','.tiff','.svg','.ico'].includes(path.extname(f).toLowerCase()); }
 function isAudioFile(f) { return ['.mp3','.wav','.ogg','.flac','.m4a','.aac','.wma','.opus'].includes(path.extname(f).toLowerCase()); }
@@ -309,6 +315,208 @@ async function collectFolderFiles(folder) {
 
     await walk(folder);
     return results;
+}
+
+// ─── MEGA: recursively scan folder metadata for the interactive browser ─────
+// The scan never downloads file data. Each file/folder gets a stable path key
+// so duplicate names in different branches remain independently selectable.
+async function scanFolderTree(folder) {
+    const folders = [];
+    const files = [];
+
+    async function ensureChildren(node) {
+        if (node.children && Array.isArray(node.children)) return node.children;
+        await new Promise((resolve, reject) => {
+            const fn = node.loadChildren || node.getChildren;
+            if (typeof fn !== 'function') return reject(new Error('Cannot enumerate folder children'));
+            fn.call(node, (err, children) => {
+                if (err) return reject(err);
+                node.children = children || [];
+                resolve();
+            });
+        });
+        return node.children;
+    }
+
+    async function walk(node, folderPath, folderId) {
+        const descriptor = {
+            id: folders.length,
+            node,
+            path: folderPath,
+            name: node.name || 'folder',
+            depth: folderPath.length,
+            fileCount: 0,
+            videoSize: 0,
+            parentId: folderId,
+        };
+        folders.push(descriptor);
+
+        const children = await ensureChildren(node);
+        for (const child of children) {
+            if (child.directory) {
+                await walk(child, folderPath.concat(child.name || 'folder'), descriptor.id);
+                continue;
+            }
+
+            const filePath = folderPath.concat(child.name || 'file');
+            const entry = {
+                key: filePath.join('/'),
+                node: child,
+                name: child.name || 'file',
+                size: child.size || 0,
+                folderPath,
+                folderId: descriptor.id,
+            };
+            files.push(entry);
+            descriptor.fileCount++;
+            if (isSupportedVideoFile(entry.name)) descriptor.videoSize += entry.size;
+        }
+    }
+
+    await walk(folder, [], null);
+    return { folders, files };
+}
+
+function folderPathLabel(folderPath, rootName) {
+    return [rootName].concat(folderPath || []).join(' / ');
+}
+
+function formatGigabytes(bytes) {
+    return `${((bytes || 0) / (1024 ** 3)).toFixed(2)} GB`;
+}
+
+function formatDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return '—';
+    const total = Math.ceil(seconds);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    if (hours) return `${hours}h ${minutes}m`;
+    if (minutes) return `${minutes}m ${secs}s`;
+    return `${secs}s`;
+}
+
+function formatRate(bytesPerSecond) {
+    return bytesPerSecond > 0 ? `${formatBytes(bytesPerSecond)}/s` : '—';
+}
+
+function folderSelectionKey(folder) {
+    return (folder.path || []).join('/');
+}
+
+function getSelectedVideoFiles(browser) {
+    const selectedIds = browser.selectedFolderIds;
+    if (selectedIds.size === 0) return [];
+    const folderById = new Map(browser.folders.map(folder => [folder.id, folder]));
+
+    return browser.files.filter(file => {
+        if (!isSupportedVideoFile(file.name)) return false;
+        let folderId = file.folderId;
+        while (folderId !== null && folderId !== undefined) {
+            if (selectedIds.has(folderId)) return true;
+            const folder = folderById.get(folderId);
+            folderId = folder ? folder.parentId : null;
+        }
+        return false;
+    });
+}
+
+function getBrowserTotals(browser) {
+    const selectedFiles = getSelectedVideoFiles(browser);
+    return {
+        selectedFolders: browser.folders.filter(folder =>
+            browser.selectedFolderIds.has(folder.id)
+        ).length,
+        selectedFiles,
+        videoCount: selectedFiles.length,
+        totalSize: selectedFiles.reduce((sum, file) => sum + (file.size || 0), 0),
+    };
+}
+
+function browserText(browser) {
+    const totals = getBrowserTotals(browser);
+    const pageCount = Math.max(1, Math.ceil(browser.folders.length / browser.pageSize));
+    const page = Math.min(browser.page, pageCount - 1);
+    const start = page * browser.pageSize;
+    const visibleFolders = browser.folders.slice(start, start + browser.pageSize);
+    const folderLines = visibleFolders.length
+        ? visibleFolders.map(folder => {
+            const icon = browser.selectedFolderIds.has(folder.id) ? '✅' : '📁';
+            const indent = '  '.repeat(Math.min(folder.depth, 8));
+            return `${icon} ${indent}${folder.name}`;
+        }).join('\n')
+        : 'No folders found.';
+
+    return (
+        `📂 MEGA Folder Browser\n\n` +
+        `Select one or more folders. Subfolders are included automatically.\n\n` +
+        `${folderLines}\n\n` +
+        `Page ${page + 1}/${pageCount}\n\n` +
+        `Selected folders: ${totals.selectedFolders}\n` +
+        `Total videos found: ${totals.videoCount}\n` +
+        `Total size: ${formatGigabytes(totals.totalSize)}`
+    );
+}
+
+function browserKeyboard(browser) {
+    const pageCount = Math.max(1, Math.ceil(browser.folders.length / browser.pageSize));
+    const page = Math.min(browser.page, pageCount - 1);
+    browser.page = page;
+    const start = page * browser.pageSize;
+    const rows = browser.folders.slice(start, start + browser.pageSize).map(folder => {
+        const icon = browser.selectedFolderIds.has(folder.id) ? '✅' : '📁';
+        const label = `${icon} ${'  '.repeat(Math.min(folder.depth, 4))}${folder.name}`;
+        return [{ text: label.slice(0, 60), callback_data: `fb_toggle:${browser.userId}:${folder.id}` }];
+    });
+
+    if (pageCount > 1) {
+        rows.push([
+            { text: page > 0 ? '◀ Previous' : ' ', callback_data: page > 0 ? `fb_page:${browser.userId}:${page - 1}` : `fb_noop:${browser.userId}` },
+            { text: `${page + 1}/${pageCount}`, callback_data: `fb_noop:${browser.userId}` },
+            { text: page < pageCount - 1 ? 'Next ▶' : ' ', callback_data: page < pageCount - 1 ? `fb_page:${browser.userId}:${page + 1}` : `fb_noop:${browser.userId}` },
+        ]);
+    }
+
+    rows.push([
+        { text: '▶ Start Upload', callback_data: `fb_start:${browser.userId}` },
+        { text: '🔄 Refresh', callback_data: `fb_refresh:${browser.userId}` },
+    ]);
+    rows.push([{ text: '❌ Cancel', callback_data: `fb_cancel:${browser.userId}` }]);
+    return { inline_keyboard: rows };
+}
+
+async function editFolderBrowser(ctx, browser) {
+    try {
+        await ctx.telegram.editMessageText(
+            browser.chatId,
+            browser.messageId,
+            null,
+            browserText(browser),
+            { reply_markup: browserKeyboard(browser) }
+        );
+    } catch (err) {
+        if (!isIgnorableEditError(err)) log('WARN', `Cannot render folder browser: ${err.message}`);
+    }
+}
+
+function makeFolderBrowser(userId, chatId, megaUrl, folderNode, tree, messageId) {
+    return {
+        userId: String(userId),
+        chatId,
+        megaUrl,
+        folderNode,
+        rootName: folderNode.name || 'folder',
+        folders: tree.folders,
+        files: tree.files,
+        selectedFolderIds: new Set(),
+        page: 0,
+        pageSize: 35,
+        messageId,
+    };
+}
+
+function fileIdentity(file) {
+    return file.key || file.name;
 }
 
 // ─── MEGA: download a single file node to disk (with retry) ──────────────────
@@ -477,7 +685,7 @@ async function processSingleFile(ctx, fileNode, statusMsg) {
 }
 
 // ─── Core: MEGA folder – stream one file at a time ───────────────────────────
-async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
+async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg, selectedFiles = null) {
     const chatId  = ctx.chat.id;
     const userId  = ctx.from ? ctx.from.id : chatId;
     const tempDir = path.join(os.tmpdir(), 'mega-bot', userId.toString());
@@ -492,21 +700,25 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
     // ── 1. Enumerate file list (metadata only – no download) ──────────────────
     await editStatus('📂 *Loading folder contents…*\n\nReading file list from MEGA…');
 
-    let allFiles;
-    try {
-        allFiles = await collectFolderFiles(folderNode);
-    } catch (err) {
-        await editStatus(`❌ *Cannot Read Folder*\n\n*Error:* ${err.message}`);
-        return;
+    let allFiles = selectedFiles;
+    if (!allFiles) {
+        try {
+            allFiles = await collectFolderFiles(folderNode);
+        } catch (err) {
+            await editStatus(`❌ *Cannot Read Folder*\n\n*Error:* ${err.message}`);
+            return;
+        }
     }
+    // Folder transfers only ever include the formats supported by the browser.
+    allFiles = allFiles.filter(file => isSupportedVideoFile((file.node || file).name));
 
     if (allFiles.length === 0) {
-        await editStatus('❌ *Folder is empty.*');
+        await editStatus('❌ *No supported videos were selected.*');
         return;
     }
 
     const totalFiles = allFiles.length;
-    const totalSize  = allFiles.reduce((s, f) => s + (f.size || 0), 0);
+    const totalSize  = allFiles.reduce((s, f) => s + ((f.node || f).size || 0), 0);
     const folderName = folderNode.name || 'folder';
 
     log('INFO', `📁 Folder "${folderName}": ${totalFiles} files, ${formatBytes(totalSize)}`);
@@ -521,6 +733,7 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
             userId,
             totalFiles,
             totalSize,
+            selectedFileKeys: allFiles.map(fileIdentity),
             completed:  [],   // array of successfully uploaded file names
             status:     'active',
         };
@@ -533,7 +746,7 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
     }
 
     const completedSet = new Set(session.completed);
-    const pendingFiles = allFiles.filter(f => !completedSet.has(f.name));
+    const pendingFiles = allFiles.filter(f => !completedSet.has(fileIdentity(f)));
     const alreadyDone  = totalFiles - pendingFiles.length;
 
     if (alreadyDone > 0) {
@@ -622,7 +835,11 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
             return;
         }
 
-        const fileNode   = pendingFiles[i];
+        const selectedFile = pendingFiles[i];
+        const fileNode   = selectedFile.node || selectedFile;
+        const currentFolder = selectedFile.folderPath
+            ? [folderName].concat(selectedFile.folderPath).join(' / ')
+            : folderName;
         const globalIdx  = sentCount + failedCount + i + 1; // position in the full list
         const tempPath   = path.join(tempDir, fileNode.name.replace(/[/\\]/g, '_'));
 
@@ -642,18 +859,28 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
 
         // ── 4a. Download this one file ────────────────────────────────────────
         let dlOk = false;
+        const downloadStartedAt = Date.now();
         try {
             await downloadOneFile(fileNode, tempPath, (p) => {
                 const pct  = (p * 100).toFixed(1);
                 const done = formatBytes(p * (fileNode.size || 0));
                 const tot  = formatBytes(fileNode.size || 0);
+                const elapsed = Math.max((Date.now() - downloadStartedAt) / 1000, 0.001);
+                const downloadSpeed = (p * (fileNode.size || 0)) / elapsed;
+                const remainingBytes = Math.max(0, (fileNode.size || 0) * (1 - p)) +
+                    pendingFiles.slice(i + 1)
+                        .reduce((sum, file) => sum + ((file.node || file).size || 0), 0);
+                const eta = downloadSpeed > 0 ? remainingBytes / downloadSpeed : 0;
                 progressUpdater(
-                    `📁 *${folderName}*\n` +
+                    `📁 *Current Folder:* ${currentFolder}\n` +
+                    `🎬 *Current File:* \`${fileNode.name}\`\n` +
                     `📊 File ${globalIdx}/${totalFiles}\n\n` +
                     `⬇️ *Downloading:* \`${fileNode.name}\`\n` +
                     `*Progress:* ${pct}%  •  ${done} / ${tot}\n` +
-                    `[${makeProgressBar(p)}]\n\n` +
-                    `✅ Sent: ${sentCount}  ❌ Failed: ${failedCount}`
+                    `[${makeProgressBar(p)}]\n` +
+                    `Download speed: ${formatRate(downloadSpeed)}\n\n` +
+                    `ETA: ${formatDuration(eta)}\n\n` +
+                    `✅ Completed: ${sentCount}/${totalFiles}  📋 Remaining: ${totalFiles - sentCount}`
                 );
             });
             dlOk = true;
@@ -672,24 +899,33 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
 
         // ── 4b. Upload immediately ────────────────────────────────────────────
         try {
+            const uploadStartedAt = Date.now();
             await sendTelegramFile(ctx, tempPath, fileNode.name, fileNode.size, (p) => {
                 const pct  = (p * 100).toFixed(1);
                 const done = formatBytes(p * (fileNode.size || 0));
                 const tot  = formatBytes(fileNode.size || 0);
+                const elapsed = Math.max((Date.now() - uploadStartedAt) / 1000, 0.001);
+                const uploadSpeed = (p * (fileNode.size || 0)) / elapsed;
+                const remainingBytes = pendingFiles.slice(i + 1)
+                    .reduce((sum, file) => sum + ((file.node || file).size || 0), 0);
+                const eta = uploadSpeed > 0 ? remainingBytes / uploadSpeed : 0;
                 progressUpdater(
-                    `📁 *${folderName}*\n` +
+                    `📁 *Current Folder:* ${currentFolder}\n` +
+                    `🎬 *Current File:* \`${fileNode.name}\`\n` +
                     `📊 File ${globalIdx}/${totalFiles}\n\n` +
                     `📤 *Uploading:* \`${fileNode.name}\`\n` +
                     `*Progress:* ${pct}%  •  ${done} / ${tot}\n` +
-                    `[${makeProgressBar(p)}]\n\n` +
-                    `✅ Sent: ${sentCount}  ❌ Failed: ${failedCount}`
+                    `[${makeProgressBar(p)}]\n` +
+                    `Upload speed: ${formatRate(uploadSpeed)}\n` +
+                    `ETA: ${formatDuration(eta)}\n\n` +
+                    `✅ Completed: ${sentCount}/${totalFiles}  📋 Remaining: ${totalFiles - sentCount}`
                 );
             });
             sentCount++;
             log('INFO', `✅ Upload OK [${sentCount}/${totalFiles}]: ${fileNode.name}`);
 
             // Mark as completed in session – survive a restart.
-            session.completed.push(fileNode.name);
+            session.completed.push(fileIdentity(selectedFile));
             saveSession(megaUrl, session);
 
             // Brief pause between files to ease Telegram rate limits.
@@ -728,13 +964,13 @@ async function processFolderStreaming(ctx, folderNode, megaUrl, statusMsg) {
 }
 
 // ─── Core handler ─────────────────────────────────────────────────────────────
-async function processMegaLink(ctx, megaLink) {
+async function processMegaLink(ctx, megaLink, resumeExisting = false) {
     const userId   = String(ctx.from ? ctx.from.id : ctx.chat.id);
     const chatId   = ctx.chat.id;
     const chatType = ctx.chat.type;
 
     // Prevent starting a second task while one is already running.
-    if (activeTasks.has(userId)) {
+    if (activeTasks.has(userId) || folderBrowsers.has(userId)) {
         await safeReply(ctx,
             `⚠️ *You already have an active download\\.*\n\nUse /stop to pause it first\\.`,
             { parse_mode: 'MarkdownV2' }
@@ -745,8 +981,8 @@ async function processMegaLink(ctx, megaLink) {
     log('INFO', `📩 Processing | chat=${chatId} (${chatType}) user=${userId}`);
     log('INFO', `🔗 URL: ${megaLink}`);
 
-    // Register task (type updated to 'folder' inside processFolderStreaming).
-    activeTasks.set(userId, { megaUrl: megaLink, chatId, type: 'single' });
+    // Register task immediately so a second link cannot replace the browser.
+    activeTasks.set(userId, { megaUrl: megaLink, chatId, type: 'browser' });
 
     let statusMsg = null;
 
@@ -772,10 +1008,44 @@ async function processMegaLink(ctx, megaLink) {
         log('INFO', `✅ Loaded: "${item.name}" (${item.directory ? 'folder' : formatBytes(item.size)})`);
 
         if (item.directory) {
-            // ── FOLDER: stream one file at a time ─────────────────────────────
-            activeTasks.set(userId, { megaUrl: megaLink, chatId, type: 'folder' });
-            await processFolderStreaming(ctx, item, megaLink, statusMsg);
-            statusMsg = null; // processFolderStreaming owns and deletes it
+            // ── FOLDER: scan metadata and wait for folder selection ───────────
+            await safeEditMessage(
+                ctx.telegram,
+                chatId,
+                statusMsg && statusMsg.message_id,
+                '📂 *Scanning folder structure…*\n\nReading folders and video metadata from MEGA…'
+            );
+            let tree;
+            try {
+                tree = await scanFolderTree(item);
+            } catch (err) {
+                await safeEditMessage(
+                    ctx.telegram,
+                    chatId,
+                    statusMsg && statusMsg.message_id,
+                    `❌ *Cannot Read Folder*\n\n*Error:* ${err.message}`
+                );
+                return;
+            }
+
+            const browser = makeFolderBrowser(userId, chatId, megaLink, item, tree, statusMsg.message_id);
+            const pausedSession = loadSession(megaLink);
+            if (resumeExisting && pausedSession && pausedSession.status === 'paused' && Array.isArray(pausedSession.selectedFileKeys)) {
+                // /resume uses the same metadata scan, then bypasses the picker.
+                const selectedKeys = new Set(pausedSession.selectedFileKeys);
+                const selectedFiles = tree.files.filter(file => selectedKeys.has(fileIdentity(file)));
+                if (selectedFiles.length > 0) {
+                    activeTasks.set(userId, { megaUrl: megaLink, chatId, type: 'folder' });
+                    await processFolderStreaming(ctx, item, megaLink, statusMsg, selectedFiles);
+                    statusMsg = null;
+                    return;
+                }
+            }
+
+            folderBrowsers.set(userId, browser);
+            await editFolderBrowser(ctx, browser);
+            // Keep the user task occupied while the picker is open.
+            statusMsg = null;
 
         } else {
             // ── SINGLE FILE ───────────────────────────────────────────────────
@@ -798,7 +1068,7 @@ async function processMegaLink(ctx, megaLink) {
             await safeReply(ctx, msg);
         }
     } finally {
-        activeTasks.delete(userId);
+        if (!folderBrowsers.has(userId)) activeTasks.delete(userId);
         stopSignals.delete(userId);
     }
 }
@@ -865,6 +1135,11 @@ bot.help((ctx) => {
 bot.command('stop', async (ctx) => {
     const userId = String(ctx.from ? ctx.from.id : ctx.chat.id);
 
+    if (folderBrowsers.has(userId)) {
+        await safeReply(ctx, '📂 Folder selection is open. Choose Start Upload or Cancel first.');
+        return;
+    }
+
     if (!activeTasks.has(userId)) {
         await safeReply(ctx, '❌ No active download found\\. Start one by sending a MEGA link\\.', { parse_mode: 'MarkdownV2' });
         return;
@@ -918,12 +1193,28 @@ bot.command('resume', async (ctx) => {
     log('INFO', `▶️ /resume requested by user ${userId} – folder "${session.folderName}"`);
 
     // Re-dispatch through the normal pipeline; session state is already on disk.
-    await processMegaLink(ctx, session.url);
+    await processMegaLink(ctx, session.url, true);
 });
 
 // ─── /cancel ──────────────────────────────────────────────────────────────────
 bot.command('cancel', async (ctx) => {
     const userId = String(ctx.from ? ctx.from.id : ctx.chat.id);
+
+    if (folderBrowsers.has(userId)) {
+        const browser = folderBrowsers.get(userId);
+        folderBrowsers.delete(userId);
+        activeTasks.delete(userId);
+        await safeReply(ctx, '❌ Folder selection cancelled.');
+        try {
+            await ctx.telegram.editMessageText(
+                browser.chatId,
+                browser.messageId,
+                null,
+                '❌ Folder selection cancelled.'
+            );
+        } catch (_) {}
+        return;
+    }
 
     const hasActive = activeTasks.has(userId);
     const session   = !hasActive ? findPausedSession(userId) : null;
@@ -955,7 +1246,136 @@ bot.command('cancel', async (ctx) => {
 });
 
 // ─── Inline button callbacks ───────────────────────────────────────────────────
-// Buttons are sent with the pause message: resume:<userId>, cancel:<userId>, main_menu:<userId>
+// Folder browser buttons use fb_* callbacks. Pause controls use the legacy
+// resume/cancel/main_menu callbacks below.
+
+function getBrowserForCallback(ctx, targetUserId) {
+    const callerId = String(ctx.from ? ctx.from.id : ctx.chat.id);
+    if (callerId !== String(targetUserId)) return null;
+    return folderBrowsers.get(callerId) || null;
+}
+
+bot.action(/^fb_noop:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+});
+
+bot.action(/^fb_toggle:(.+):(\d+)$/, async (ctx) => {
+    const browser = getBrowserForCallback(ctx, ctx.match[1]);
+    if (!browser) {
+        await ctx.answerCbQuery('This folder browser is no longer active.').catch(() => {});
+        return;
+    }
+
+    const folder = browser.folders[Number(ctx.match[2])];
+    if (!folder) {
+        await ctx.answerCbQuery('Folder not found. Please refresh.').catch(() => {});
+        return;
+    }
+
+    if (browser.selectedFolderIds.has(folder.id)) browser.selectedFolderIds.delete(folder.id);
+    else browser.selectedFolderIds.add(folder.id);
+
+    await ctx.answerCbQuery().catch(() => {});
+    await editFolderBrowser(ctx, browser);
+});
+
+bot.action(/^fb_page:(.+):(\d+)$/, async (ctx) => {
+    const browser = getBrowserForCallback(ctx, ctx.match[1]);
+    if (!browser) {
+        await ctx.answerCbQuery('This folder browser is no longer active.').catch(() => {});
+        return;
+    }
+
+    browser.page = Number(ctx.match[2]);
+    await ctx.answerCbQuery().catch(() => {});
+    await editFolderBrowser(ctx, browser);
+});
+
+bot.action(/^fb_refresh:(.+)$/, async (ctx) => {
+    const browser = getBrowserForCallback(ctx, ctx.match[1]);
+    if (!browser) {
+        await ctx.answerCbQuery('This folder browser is no longer active.').catch(() => {});
+        return;
+    }
+
+    await ctx.answerCbQuery('Refreshing folder list…').catch(() => {});
+    try {
+        const selectedPaths = new Set(
+            [...browser.selectedFolderIds]
+                .map(id => browser.folders.find(folder => folder.id === id))
+                .filter(Boolean)
+                .map(folderSelectionKey)
+        );
+        const tree = await scanFolderTree(browser.folderNode);
+        browser.folders = tree.folders;
+        browser.files = tree.files;
+        browser.selectedFolderIds = new Set(
+            tree.folders
+                .filter(folder => selectedPaths.has(folderSelectionKey(folder)))
+                .map(folder => folder.id)
+        );
+        await editFolderBrowser(ctx, browser);
+    } catch (err) {
+        log('WARN', `Folder refresh failed: ${err.message}`);
+        await ctx.answerCbQuery(`Refresh failed: ${err.message}`.slice(0, 190)).catch(() => {});
+    }
+});
+
+bot.action(/^fb_cancel:(.+)$/, async (ctx) => {
+    const callerId = String(ctx.from ? ctx.from.id : ctx.chat.id);
+    const browser = getBrowserForCallback(ctx, ctx.match[1]);
+    if (!browser) {
+        await ctx.answerCbQuery('This folder browser is no longer active.').catch(() => {});
+        return;
+    }
+
+    folderBrowsers.delete(callerId);
+    activeTasks.delete(callerId);
+    await ctx.answerCbQuery('Selection cancelled.').catch(() => {});
+    try {
+        await ctx.editMessageText('❌ Folder selection cancelled.');
+    } catch (err) {
+        if (!isIgnorableEditError(err)) log('WARN', `Cannot cancel folder browser: ${err.message}`);
+    }
+});
+
+bot.action(/^fb_start:(.+)$/, async (ctx) => {
+    const callerId = String(ctx.from ? ctx.from.id : ctx.chat.id);
+    const browser = getBrowserForCallback(ctx, ctx.match[1]);
+    if (!browser) {
+        await ctx.answerCbQuery('This folder browser is no longer active.').catch(() => {});
+        return;
+    }
+
+    const selectedFiles = getSelectedVideoFiles(browser);
+    if (selectedFiles.length === 0) {
+        await ctx.answerCbQuery('Select at least one folder containing a supported video.').catch(() => {});
+        return;
+    }
+
+    const totals = getBrowserTotals(browser);
+    folderBrowsers.delete(callerId);
+    activeTasks.set(callerId, {
+        megaUrl: browser.megaUrl,
+        chatId: browser.chatId,
+        type: 'folder',
+    });
+    await ctx.answerCbQuery('Starting upload…').catch(() => {});
+    try { await ctx.editMessageReplyMarkup({ inline_keyboard: [] }); } catch (_) {}
+
+    log('INFO', `▶️ Folder selection started | user=${callerId} folders=${totals.selectedFolders} videos=${selectedFiles.length}`);
+    try {
+        await processFolderStreaming(
+            ctx,
+            browser.folderNode,
+            browser.megaUrl,
+            { message_id: browser.messageId },
+            selectedFiles
+        );
+    } finally {
+        activeTasks.delete(callerId);
+    }
+});
 
 bot.action(/^resume:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
@@ -983,7 +1403,7 @@ bot.action(/^resume:(.+)$/, async (ctx) => {
     } catch (_) {}
 
     log('INFO', `▶️ Resume button pressed by user ${callerId}`);
-    await processMegaLink(ctx, session.url);
+    await processMegaLink(ctx, session.url, true);
 });
 
 bot.action(/^cancel:(.+)$/, async (ctx) => {
